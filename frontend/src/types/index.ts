@@ -1022,6 +1022,18 @@ export interface GrokQuotaWindow {
   reset_at?: string
 }
 
+export interface GrokCreditBalance {
+  credit_type?: string
+  label?: string
+  amount?: number | null
+  limit?: number | null
+  used?: number | null
+  remaining?: number | null
+  currency?: string
+  reset_at?: string | null
+  source?: string
+}
+
 export interface AccountUsageInfo {
   source?: 'passive' | 'active'
   updated_at: string | null
@@ -1038,6 +1050,7 @@ export interface AccountUsageInfo {
   antigravity_quota?: Record<string, AntigravityModelQuota> | null
   grok_request_quota?: GrokQuotaWindow | null
   grok_token_quota?: GrokQuotaWindow | null
+  grok_credits?: GrokCreditBalance[] | null
   grok_retry_after_seconds?: number | null
   grok_entitlement_status?: string
   grok_quota_snapshot_state?: string

@@ -46,9 +46,22 @@ export interface GrokQuotaWindow {
   reset_at?: string | null
 }
 
+export interface GrokCreditBalance {
+  credit_type?: string
+  label?: string
+  amount?: number | null
+  limit?: number | null
+  used?: number | null
+  remaining?: number | null
+  currency?: string
+  reset_at?: string | null
+  source?: string
+}
+
 export interface GrokQuotaSnapshot {
   requests?: GrokQuotaWindow | null
   tokens?: GrokQuotaWindow | null
+  credits?: GrokCreditBalance[] | null
   retry_after_seconds?: number | null
   subscription_tier?: string
   entitlement_status?: string

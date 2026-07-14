@@ -91,6 +91,8 @@ func TestGatewayRoutesGrokImagesAndVideosPathsAreRegistered(t *testing.T) {
 		"/v1/images/edits",
 		"/images/generations",
 		"/images/edits",
+		"/v1/videos",
+		"/videos",
 		"/v1/videos/generations",
 		"/videos/generations",
 	} {
@@ -104,6 +106,8 @@ func TestGatewayRoutesGrokImagesAndVideosPathsAreRegistered(t *testing.T) {
 	}
 
 	for _, path := range []string{
+		"/v1/videos?request_id=request-123",
+		"/videos?request_id=request-123",
 		"/v1/videos/request-123",
 		"/videos/request-123",
 	} {
@@ -124,8 +128,12 @@ func TestGatewayRoutesNonGrokVideosAreRejectedAtPlatformGate(t *testing.T) {
 		path   string
 		body   string
 	}{
+		{http.MethodPost, "/v1/videos", `{"model":"grok-imagine-video-1.5","prompt":"waves"}`},
+		{http.MethodPost, "/videos", `{"model":"grok-imagine-video-1.5","prompt":"waves"}`},
 		{http.MethodPost, "/v1/videos/generations", `{"model":"grok-imagine-video-1.5","prompt":"waves"}`},
 		{http.MethodPost, "/videos/generations", `{"model":"grok-imagine-video-1.5","prompt":"waves"}`},
+		{http.MethodGet, "/v1/videos?request_id=request-123", ""},
+		{http.MethodGet, "/videos?request_id=request-123", ""},
 		{http.MethodGet, "/v1/videos/request-123", ""},
 		{http.MethodGet, "/videos/request-123", ""},
 	} {

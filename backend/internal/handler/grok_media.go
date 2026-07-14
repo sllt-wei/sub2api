@@ -33,7 +33,14 @@ func (h *OpenAIGatewayHandler) GrokVideoGeneration(c *gin.Context) {
 
 // GrokVideoStatus handles xAI video status retrieval through Grok groups.
 func (h *OpenAIGatewayHandler) GrokVideoStatus(c *gin.Context) {
-	h.handleGrokMedia(c, service.GrokMediaEndpointVideoStatus, c.Param("request_id"))
+	requestID := strings.TrimSpace(c.Param("request_id"))
+	if requestID == "" {
+		requestID = strings.TrimSpace(c.Query("request_id"))
+	}
+	if requestID == "" {
+		requestID = strings.TrimSpace(c.Query("id"))
+	}
+	h.handleGrokMedia(c, service.GrokMediaEndpointVideoStatus, requestID)
 }
 
 func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.GrokMediaEndpoint, requestID string) {

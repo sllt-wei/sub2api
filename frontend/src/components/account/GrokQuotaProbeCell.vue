@@ -48,7 +48,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
+import type { GrokCreditBalance, GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
 import type { Account } from '@/types'
 
 const props = defineProps<{
@@ -82,6 +82,39 @@ const formatWindow = (label: string, window?: GrokQuotaWindow | null): string | 
   return `${label} ${window.remaining}/${window.limit}`
 }
 
+const creditLabel = (credit: GrokCreditBalance): string => {
+  switch ((credit.credit_type || '').trim()) {
+    case 'monthly_credits':
+      return t('admin.accounts.usageWindow.grokMonthlyCredits')
+    case 'pay_as_you_go':
+      return t('admin.accounts.usageWindow.grokPayAsYouGo')
+    case 'prepaid_credits':
+      return t('admin.accounts.usageWindow.grokPrepaidCredits')
+    case 'extra_usage_credits':
+      return t('admin.accounts.usageWindow.grokExtraUsageCredits')
+    default:
+      return credit.label || t('admin.accounts.usageWindow.grokCredits')
+  }
+}
+
+const formatCreditAmount = (value?: number | null, currency = 'USD'): string | null => {
+  if (value == null || Number.isNaN(value)) return null
+  const prefix = currency === 'USD' || !currency ? '$' : `${currency} `
+  return `${prefix}${value.toFixed(2)}`
+}
+
+const formatCredit = (credit: GrokCreditBalance): string | null => {
+  const currency = credit.currency || 'USD'
+  const remaining = formatCreditAmount(credit.remaining, currency)
+  const limit = formatCreditAmount(credit.limit, currency)
+  const amount = formatCreditAmount(credit.amount, currency)
+  if (remaining && (limit || amount)) return `${creditLabel(credit)} ${remaining}/${limit || amount}`
+  if (remaining) return `${creditLabel(credit)} ${remaining}`
+  if (limit) return `${creditLabel(credit)} ${limit}`
+  if (amount) return `${creditLabel(credit)} ${amount}`
+  return null
+}
+
 const retryAfterLabel = computed(() => {
   const seconds = data.value?.snapshot?.retry_after_seconds
   if (seconds == null || seconds <= 0) return null
@@ -95,7 +128,8 @@ const summary = computed(() => {
   if (!snapshot) return t('admin.accounts.usageWindow.grokNoHeaders')
   const parts = [
     formatWindow(t('admin.accounts.usageWindow.grokRequests'), snapshot.requests),
-    formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens)
+    formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens),
+    ...(snapshot.credits || []).map(formatCredit)
   ].filter(Boolean)
   if (retryAfterLabel.value) {
     parts.push(t('admin.accounts.usageWindow.grokRetryAfter', { time: retryAfterLabel.value }))

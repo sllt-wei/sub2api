@@ -381,6 +381,21 @@
             </span>
           </div>
         </div>
+        <div v-if="grokCreditLines.length" class="mb-0.5 space-y-0.5">
+          <div
+            v-for="credit in grokCreditLines"
+            :key="credit.key"
+            class="flex max-w-[220px] flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] text-gray-500 dark:text-gray-400"
+          >
+            <span class="rounded bg-cyan-50 px-1.5 py-0.5 font-medium text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300">
+              {{ credit.label }}
+            </span>
+            <span>{{ credit.primary }}</span>
+            <span v-if="credit.secondary" class="text-gray-400 dark:text-gray-500">
+              {{ credit.secondary }}
+            </span>
+          </div>
+        </div>
         <UsageProgressBar
           v-if="grokRequestQuotaBar"
           :label="t('admin.accounts.usageWindow.grokRequests')"
@@ -600,7 +615,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats } from '@/types'
+import type { Account, AccountUsageInfo, GeminiCredentials, GrokCreditBalance, WindowStats } from '@/types'
 import { buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
 import { formatCompactNumber, formatRelativeTime } from '@/utils/format'
@@ -1045,9 +1060,63 @@ const makeGrokQuotaBar = (quota?: { limit?: number | null; remaining?: number | 
 
 const grokRequestQuotaBar = computed(() => makeGrokQuotaBar(usageInfo.value?.grok_request_quota))
 const grokTokenQuotaBar = computed(() => makeGrokQuotaBar(usageInfo.value?.grok_token_quota))
+const grokCreditLabel = (credit: GrokCreditBalance): string => {
+  switch ((credit.credit_type || '').trim()) {
+    case 'monthly_credits':
+      return t('admin.accounts.usageWindow.grokMonthlyCredits')
+    case 'pay_as_you_go':
+      return t('admin.accounts.usageWindow.grokPayAsYouGo')
+    case 'prepaid_credits':
+      return t('admin.accounts.usageWindow.grokPrepaidCredits')
+    case 'extra_usage_credits':
+      return t('admin.accounts.usageWindow.grokExtraUsageCredits')
+    default:
+      return credit.label || t('admin.accounts.usageWindow.grokCredits')
+  }
+}
+const formatGrokCreditAmount = (value?: number | null, currency = 'USD'): string | null => {
+  if (value == null || Number.isNaN(value)) return null
+  const prefix = currency === 'USD' || !currency ? '$' : `${currency} `
+  return `${prefix}${value.toFixed(2)}`
+}
+const grokCreditLines = computed(() => {
+  const credits = usageInfo.value?.grok_credits || []
+  return credits
+    .map((credit, index) => {
+      const currency = credit.currency || 'USD'
+      const remaining = formatGrokCreditAmount(credit.remaining, currency)
+      const limit = formatGrokCreditAmount(credit.limit, currency)
+      const amount = formatGrokCreditAmount(credit.amount, currency)
+      const used = formatGrokCreditAmount(credit.used, currency)
+
+      let primary = ''
+      if (remaining && (limit || amount)) {
+        primary = `${remaining}/${limit || amount}`
+      } else if (remaining) {
+        primary = `${t('admin.accounts.usageWindow.grokCreditRemaining')} ${remaining}`
+      } else if (limit) {
+        primary = `${t('admin.accounts.usageWindow.grokCreditLimit')} ${limit}`
+      } else if (amount) {
+        primary = amount
+      }
+      if (!primary) return null
+
+      const secondaryParts: string[] = []
+      if (used) {
+        secondaryParts.push(`${t('admin.accounts.usageWindow.grokCreditUsed')} ${used}`)
+      }
+      return {
+        key: `${credit.credit_type || credit.label || 'credit'}-${index}`,
+        label: grokCreditLabel(credit),
+        primary,
+        secondary: secondaryParts.join(' | ')
+      }
+    })
+    .filter((line): line is { key: string; label: string; primary: string; secondary: string } => !!line)
+})
 const grokQuotaUnknown = computed(() => {
   if (props.account.platform !== 'grok') return false
-  if (grokRequestQuotaBar.value || grokTokenQuotaBar.value) return false
+  if (grokRequestQuotaBar.value || grokTokenQuotaBar.value || grokCreditLines.value.length > 0) return false
   return usageInfo.value?.grok_quota_snapshot_state !== 'observed'
 })
 const grokQuotaUnknownLabel = computed(() => {
