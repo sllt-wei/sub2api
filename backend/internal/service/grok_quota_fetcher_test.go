@@ -11,9 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func grokInt64PtrForTest(v int64) *int64     { return &v }
-func grokIntPtrForTest(v int) *int           { return &v }
-func grokFloatPtrForTest(v float64) *float64 { return &v }
+func grokInt64PtrForTest(v int64) *int64 { return &v }
+func grokIntPtrForTest(v int) *int       { return &v }
 
 func TestGrokQuotaFetcherBuildUsageInfoUnknownUntilFirstSnapshot(t *testing.T) {
 	t.Parallel()
@@ -69,14 +68,6 @@ func TestGrokQuotaFetcherBuildUsageInfoFromSnapshot(t *testing.T) {
 					Limit:     grokInt64PtrForTest(1000),
 					Remaining: grokInt64PtrForTest(900),
 				},
-				Credits: []xai.CreditBalance{
-					{
-						CreditType: "monthly_credits",
-						Label:      "Monthly credits",
-						Amount:     grokFloatPtrForTest(5),
-						Currency:   "USD",
-					},
-				},
 				RetryAfterSeconds: grokIntPtrForTest(30),
 				SubscriptionTier:  "supergrok",
 				EntitlementStatus: "active",
@@ -96,9 +87,6 @@ func TestGrokQuotaFetcherBuildUsageInfoFromSnapshot(t *testing.T) {
 	require.Equal(t, "active", usage.GrokEntitlementStatus)
 	require.Equal(t, int64(100), *usage.GrokRequestQuota.Limit)
 	require.Equal(t, int64(12), *usage.GrokRequestQuota.Remaining)
-	require.Len(t, usage.GrokCredits, 1)
-	require.Equal(t, "monthly_credits", usage.GrokCredits[0].CreditType)
-	require.Equal(t, 5.0, *usage.GrokCredits[0].Amount)
 	require.Equal(t, 30, *usage.GrokRetryAfterSeconds)
 	require.NotNil(t, usage.UpdatedAt)
 	require.Equal(t, updatedAt, usage.GrokLastQuotaProbeAt)

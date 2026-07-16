@@ -163,7 +163,9 @@ func TestGatewayRoutesGrokImagesAndVideosPathsAreRegistered(t *testing.T) {
 		"/v1/videos?request_id=request-123",
 		"/videos?request_id=request-123",
 		"/v1/videos/request-123",
+		"/v1/videos/request-123/content",
 		"/videos/request-123",
+		"/videos/request-123/content",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
@@ -193,7 +195,9 @@ func TestGatewayRoutesNonGrokVideosAreRejectedAtPlatformGate(t *testing.T) {
 		{http.MethodGet, "/v1/videos?request_id=request-123", ""},
 		{http.MethodGet, "/videos?request_id=request-123", ""},
 		{http.MethodGet, "/v1/videos/request-123", ""},
+		{http.MethodGet, "/v1/videos/request-123/content", ""},
 		{http.MethodGet, "/videos/request-123", ""},
+		{http.MethodGet, "/videos/request-123/content", ""},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 		req.Header.Set("Content-Type", "application/json")

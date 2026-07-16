@@ -75,7 +75,6 @@ func (f *GrokQuotaFetcher) BuildUsageInfo(account *Account) *UsageInfo {
 	}
 	usage.GrokRequestQuota = snapshot.Requests
 	usage.GrokTokenQuota = snapshot.Tokens
-	usage.GrokCredits = snapshot.Credits
 	usage.GrokRetryAfterSeconds = snapshot.RetryAfterSeconds
 	if usage.SubscriptionTier == "" {
 		usage.SubscriptionTier = snapshot.SubscriptionTier

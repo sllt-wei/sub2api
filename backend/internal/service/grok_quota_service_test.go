@@ -278,69 +278,6 @@ func TestGrokQuotaServiceProbeUsageIgnoresAccountGrokMapping(t *testing.T) {
 	require.NotContains(t, string(upstream.lastBody), "grok-composer")
 }
 
-func TestGrokQuotaServiceProbeUsageFetchesManagementCredits(t *testing.T) {
-	t.Parallel()
-
-	account := &Account{
-		ID:          49,
-		Platform:    PlatformGrok,
-		Type:        AccountTypeOAuth,
-		Concurrency: 1,
-		Credentials: map[string]any{
-			"access_token":   "access-token",
-			"expires_at":     time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
-			"management_key": "mgmt-key",
-			"team_id":        "team-123",
-		},
-	}
-	repo := &grokQuotaAccountRepo{
-		mockAccountRepoForPlatform: &mockAccountRepoForPlatform{
-			accountsByID: map[int64]*Account{49: account},
-		},
-	}
-	upstream := &httpUpstreamRecorder{responses: []*http.Response{
-		{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{},
-			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_probe"}`)),
-		},
-		{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"defaultCredits":500,"effectiveSpendingLimit":2500,"coreInvoice":{"prepaidCredits":1000,"prepaidCreditsUsed":250}}`)),
-		},
-		{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"effectiveSpendingLimit":3000}`)),
-		},
-		{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"total":1750}`)),
-		},
-	}}
-	svc := NewGrokQuotaService(repo, nil, NewGrokTokenProvider(repo, nil), upstream)
-
-	result, err := svc.ProbeUsage(context.Background(), 49)
-	require.NoError(t, err)
-	require.NotNil(t, result.Snapshot)
-	require.True(t, result.Snapshot.HeadersObserved)
-	require.Len(t, result.Snapshot.Credits, 3)
-	require.Equal(t, "https://management-api.x.ai/v1/billing/teams/team-123/postpaid/invoice/preview", upstream.requests[1].URL.String())
-	require.Equal(t, "Bearer mgmt-key", upstream.requests[1].Header.Get("Authorization"))
-	require.Equal(t, "monthly_credits", result.Snapshot.Credits[0].CreditType)
-	require.Equal(t, 5.0, *result.Snapshot.Credits[0].Amount)
-	require.Equal(t, "pay_as_you_go", result.Snapshot.Credits[1].CreditType)
-	require.Equal(t, 30.0, *result.Snapshot.Credits[1].Limit)
-	require.Equal(t, "prepaid_credits", result.Snapshot.Credits[2].CreditType)
-	require.Equal(t, 17.5, *result.Snapshot.Credits[2].Remaining)
-
-	stored, ok := repo.updates[49][grokQuotaSnapshotExtraKey].(*xai.QuotaSnapshot)
-	require.True(t, ok)
-	require.Len(t, stored.Credits, 3)
-}
-
 func TestGrokQuotaServiceProbeUsageReportsProbeModelOnUpstreamError(t *testing.T) {
 	t.Parallel()
 
