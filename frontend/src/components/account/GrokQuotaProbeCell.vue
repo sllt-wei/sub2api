@@ -48,12 +48,14 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { GrokCreditBalance, GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
+import type { GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
 import type { Account } from '@/types'
 
 const props = defineProps<{
   account: Account
 }>()
+
+const emit = defineEmits<{ probed: [result: GrokQuotaProbeResult] }>()
 
 const { t } = useI18n()
 
@@ -82,39 +84,6 @@ const formatWindow = (label: string, window?: GrokQuotaWindow | null): string | 
   return `${label} ${window.remaining}/${window.limit}`
 }
 
-const creditLabel = (credit: GrokCreditBalance): string => {
-  switch ((credit.credit_type || '').trim()) {
-    case 'monthly_credits':
-      return t('admin.accounts.usageWindow.grokMonthlyCredits')
-    case 'pay_as_you_go':
-      return t('admin.accounts.usageWindow.grokPayAsYouGo')
-    case 'prepaid_credits':
-      return t('admin.accounts.usageWindow.grokPrepaidCredits')
-    case 'extra_usage_credits':
-      return t('admin.accounts.usageWindow.grokExtraUsageCredits')
-    default:
-      return credit.label || t('admin.accounts.usageWindow.grokCredits')
-  }
-}
-
-const formatCreditAmount = (value?: number | null, currency = 'USD'): string | null => {
-  if (value == null || Number.isNaN(value)) return null
-  const prefix = currency === 'USD' || !currency ? '$' : `${currency} `
-  return `${prefix}${value.toFixed(2)}`
-}
-
-const formatCredit = (credit: GrokCreditBalance): string | null => {
-  const currency = credit.currency || 'USD'
-  const remaining = formatCreditAmount(credit.remaining, currency)
-  const limit = formatCreditAmount(credit.limit, currency)
-  const amount = formatCreditAmount(credit.amount, currency)
-  if (remaining && (limit || amount)) return `${creditLabel(credit)} ${remaining}/${limit || amount}`
-  if (remaining) return `${creditLabel(credit)} ${remaining}`
-  if (limit) return `${creditLabel(credit)} ${limit}`
-  if (amount) return `${creditLabel(credit)} ${amount}`
-  return null
-}
-
 const retryAfterLabel = computed(() => {
   const seconds = data.value?.snapshot?.retry_after_seconds
   if (seconds == null || seconds <= 0) return null
@@ -125,19 +94,27 @@ const retryAfterLabel = computed(() => {
 const summary = computed(() => {
   const snapshot = data.value?.snapshot
   if (!data.value) return ''
-  if (!snapshot) return t('admin.accounts.usageWindow.grokNoHeaders')
-  const parts = [
-    formatWindow(t('admin.accounts.usageWindow.grokRequests'), snapshot.requests),
-    formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens),
-    ...(snapshot.credits || []).map(formatCredit)
-  ].filter(Boolean)
+  const billing = data.value.billing
+  const parts: Array<string | null> = []
+  if (billing?.period_type?.toLowerCase() === 'weekly' && billing.usage_percent != null) {
+    parts.push(t('admin.accounts.usageWindow.grokWeeklyUsage', {
+      percent: Math.round(Math.min(100, Math.max(0, billing.usage_percent)))
+    }))
+  }
+  if (snapshot) {
+    parts.push(
+      formatWindow(t('admin.accounts.usageWindow.grokRequests'), snapshot.requests),
+      formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens)
+    )
+  }
   if (retryAfterLabel.value) {
     parts.push(t('admin.accounts.usageWindow.grokRetryAfter', { time: retryAfterLabel.value }))
   }
-  if (snapshot.entitlement_status) {
+  if (snapshot?.entitlement_status) {
     parts.push(snapshot.entitlement_status)
   }
-  return parts.length > 0 ? parts.join(' | ') : t('admin.accounts.usageWindow.grokNoHeaders')
+  const visibleParts = parts.filter((part): part is string => Boolean(part))
+  return visibleParts.length > 0 ? visibleParts.join(' | ') : t('admin.accounts.usageWindow.grokNoHeaders')
 })
 
 const truncatedError = computed(() => {
@@ -151,6 +128,8 @@ const handleProbe = async () => {
   error.value = null
   try {
     data.value = await adminAPI.grok.queryQuota(props.account.id)
+    error.value = data.value.probe_error || null
+    emit('probed', data.value)
   } catch (e) {
     error.value = extractErrorMessage(e)
   } finally {

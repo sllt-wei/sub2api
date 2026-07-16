@@ -7,32 +7,38 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
-	"github.com/tidwall/gjson"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	grokQuotaUpstreamTimeout       = 20 * time.Second
-	grokQuotaManagementTimeout     = 15 * time.Second
-	grokQuotaProbeInput            = "."
-	grokQuotaDefaultModel          = "grok-4.3"
-	grokQuotaManagementDefaultBase = "https://management-api.x.ai/v1"
+	grokQuotaUpstreamTimeout = 20 * time.Second
+	grokQuotaProbeInput      = "."
+	grokQuotaDefaultModel    = grokDefaultResponsesModel
+	grokBillingExtraKey      = "grok_billing_snapshot"
 )
 
 type GrokQuotaProbeResult struct {
-	Source          string             `json:"source"`
-	Model           string             `json:"model"`
-	Snapshot        *xai.QuotaSnapshot `json:"snapshot,omitempty"`
-	StatusCode      int                `json:"status_code,omitempty"`
-	HeadersObserved bool               `json:"headers_observed"`
-	ResetSupported  bool               `json:"reset_supported"`
-	FetchedAt       int64              `json:"fetched_at"`
+	Source            string              `json:"source"`
+	Model             string              `json:"model,omitempty"`
+	Billing           *xai.BillingSummary `json:"billing,omitempty"`
+	Snapshot          *xai.QuotaSnapshot  `json:"snapshot,omitempty"`
+	LocalUsage24h     *WindowStats        `json:"local_usage_24h,omitempty"`
+	LocalUsage7d      *WindowStats        `json:"local_usage_7d,omitempty"`
+	LocalUsageMonthly *WindowStats        `json:"local_usage_monthly,omitempty"`
+	StatusCode        int                 `json:"status_code,omitempty"`
+	HeadersObserved   bool                `json:"headers_observed"`
+	ResetSupported    bool                `json:"reset_supported"`
+	FetchedAt         int64               `json:"fetched_at"`
+	Persisted         bool                `json:"persisted"`
+	ProbeError        string              `json:"probe_error,omitempty"`
 }
 
 type GrokQuotaResetResult struct {
@@ -46,6 +52,9 @@ type GrokQuotaService struct {
 	proxyRepo     ProxyRepository
 	tokenProvider *GrokTokenProvider
 	httpUpstream  HTTPUpstream
+	usageLogRepo  UsageLogRepository
+	cfg           *config.Config
+	probeFlight   singleflight.Group
 }
 
 func NewGrokQuotaService(
@@ -53,16 +62,73 @@ func NewGrokQuotaService(
 	proxyRepo ProxyRepository,
 	tokenProvider *GrokTokenProvider,
 	httpUpstream HTTPUpstream,
+	cfg *config.Config,
+	usageLogRepos ...UsageLogRepository,
 ) *GrokQuotaService {
+	var usageLogRepo UsageLogRepository
+	if len(usageLogRepos) > 0 {
+		usageLogRepo = usageLogRepos[0]
+	}
 	return &GrokQuotaService{
 		accountRepo:   accountRepo,
 		proxyRepo:     proxyRepo,
 		tokenProvider: tokenProvider,
 		httpUpstream:  httpUpstream,
+		usageLogRepo:  usageLogRepo,
+		cfg:           cfg,
 	}
 }
 
+// QueryQuota combines xAI billing data with an active quota-header probe for
+// Free accounts, whose billing response does not include usage_percent.
+func (s *GrokQuotaService) QueryQuota(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	billingResult, billingErr := s.ProbeBilling(ctx, accountID)
+	if billingErr == nil && billingResult != nil && grokBillingHasAuthoritativeQuota(billingResult.Billing) {
+		return billingResult, nil
+	}
+
+	probeResult, probeErr := s.ProbeUsage(ctx, accountID)
+	if probeErr != nil {
+		if billingResult != nil && billingResult.Billing != nil {
+			billingResult.ProbeError = probeErr.Error()
+			return billingResult, nil
+		}
+		return nil, probeErr
+	}
+	if probeResult == nil {
+		if billingErr != nil {
+			return nil, billingErr
+		}
+		return nil, infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_PROBE_EMPTY", "Grok quota probe returned no result")
+	}
+	if billingResult != nil {
+		probeResult.Source = "hybrid_probe"
+		probeResult.Billing = billingResult.Billing
+		probeResult.LocalUsage24h = billingResult.LocalUsage24h
+		probeResult.LocalUsage7d = billingResult.LocalUsage7d
+		probeResult.LocalUsageMonthly = billingResult.LocalUsageMonthly
+		probeResult.Persisted = probeResult.Persisted || billingResult.Persisted
+	}
+	return probeResult, nil
+}
+
+func grokBillingHasAuthoritativeQuota(billing *xai.BillingSummary) bool {
+	if billing == nil {
+		return false
+	}
+	return billing.UsagePercent != nil ||
+		billing.UsedPercent != nil ||
+		(billing.MonthlyLimitCents != nil && *billing.MonthlyLimitCents > 0) ||
+		strings.TrimSpace(billing.Plan) != ""
+}
+
 func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	return s.runProbeFlight(ctx, "active:"+strconv.FormatInt(accountID, 10), func(sharedCtx context.Context) (*GrokQuotaProbeResult, error) {
+		return s.probeUsage(sharedCtx, accountID)
+	})
+}
+
+func (s *GrokQuotaService) probeUsage(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
 	account, token, proxyURL, err := s.prepareProbe(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -73,7 +139,7 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadRequest, "GROK_QUOTA_PROBE_BODY_ERROR", "failed to build probe body: %v", err)
 	}
-	targetURL, err := xai.BuildResponsesURL(account.GetGrokBaseURL())
+	targetURL, err := buildGrokResponsesURL(account, s.cfg)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadRequest, "GROK_QUOTA_BASE_URL_INVALID", "invalid Grok base_url: %v", err)
 	}
@@ -87,7 +153,11 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "sub2api-grok-quota-probe/1.0")
+	if account.IsGrokOAuth() {
+		applyGrokCLIHeaders(req.Header)
+	}
+	// 探测请求与真实转发保持同一套账号级请求头覆写，避免探测通过但转发失败。
+	account.ApplyHeaderOverrides(req.Header)
 
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
 	if err != nil {
@@ -96,16 +166,18 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 	defer func() { _ = resp.Body.Close() }()
 
 	snapshot := xai.ObserveQuotaHeaders(resp.Header, resp.StatusCode, "active_probe")
-	if credits := s.fetchManagementCredits(ctx, account, proxyURL); len(credits) > 0 {
-		snapshot.Credits = mergeGrokCreditBalances(snapshot.Credits, credits)
-		snapshot.HeadersObserved = true
-		if snapshot.LastHeadersSeenAt == "" {
-			snapshot.LastHeadersSeenAt = time.Now().UTC().Format(time.RFC3339)
-		}
+	resetAt, limited := grokRateLimitResetAtForAccount(account, snapshot, time.Now())
+	if limited {
+		normalizeGrokExhaustedWindowResets(snapshot, resetAt, time.Now())
 	}
-	_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+	persistErr := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
 		grokQuotaSnapshotExtraKey: snapshot,
 	})
+	if limited {
+		persistGrokRateLimit(ctx, s.accountRepo, account, resetAt)
+	} else if isSuccessfulGrokRateLimitRecovery(account, snapshot) {
+		clearGrokRateLimitAfterRecovery(ctx, s.accountRepo, account)
+	}
 
 	result := &GrokQuotaProbeResult{
 		Source:          "active_probe",
@@ -115,17 +187,205 @@ func (s *GrokQuotaService) ProbeUsage(ctx context.Context, accountID int64) (*Gr
 		HeadersObserved: snapshot.HeadersObserved,
 		ResetSupported:  false,
 		FetchedAt:       time.Now().Unix(),
+		Persisted:       persistErr == nil,
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return result, nil
 	}
 	if resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 240))
-		bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
-		slog.Warn("grok_quota_probe_failed", "account_id", account.ID, "model", probeModel, "status", resp.StatusCode, "body", bodyText)
-		return nil, infraerrors.Newf(mapUpstreamStatus(resp.StatusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "upstream returned %d for probe model %q: %s", resp.StatusCode, probeModel, bodyText)
+		const reason = "GROK_QUOTA_PROBE_UPSTREAM_ERROR"
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		slog.Warn(
+			"grok_quota_probe_failed",
+			"account_id", account.ID,
+			"model", probeModel,
+			"status", resp.StatusCode,
+			"reason", reason,
+		)
+		return nil, infraerrors.Newf(
+			mapUpstreamStatus(resp.StatusCode),
+			reason,
+			"upstream returned %d for probe model %q",
+			resp.StatusCode,
+			probeModel,
+		)
 	}
 	return result, nil
+}
+
+// ProbeBilling only calls the xAI billing endpoints. Account usage refreshes
+// use this method so opening the account list never consumes model quota.
+func (s *GrokQuotaService) ProbeBilling(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	return s.runProbeFlight(ctx, "billing:"+strconv.FormatInt(accountID, 10), func(sharedCtx context.Context) (*GrokQuotaProbeResult, error) {
+		return s.probeBilling(sharedCtx, accountID)
+	})
+}
+
+func (s *GrokQuotaService) probeBilling(ctx context.Context, accountID int64) (*GrokQuotaProbeResult, error) {
+	account, token, proxyURL, err := s.prepareProbe(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, grokQuotaUpstreamTimeout)
+	defer cancel()
+	type billingResult struct {
+		summary *xai.BillingSummary
+		status  int
+		err     error
+	}
+	var weekly, monthly billingResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		weekly.summary, weekly.status, weekly.err = s.fetchBilling(probeCtx, account, token, proxyURL, true)
+	}()
+	go func() {
+		defer wg.Done()
+		monthly.summary, monthly.status, monthly.err = s.fetchBilling(probeCtx, account, token, proxyURL, false)
+	}()
+	wg.Wait()
+
+	weeklyOK := weekly.summary != nil
+	monthlyOK := monthly.summary != nil
+	if !weeklyOK && !monthlyOK {
+		return nil, mergeGrokBillingProbeErrors(weekly.status, monthly.status, weekly.err, monthly.err)
+	}
+	statusCode := preferSuccessfulBillingStatus(weekly.status, monthly.status, weeklyOK, monthlyOK)
+	previous, _ := grokBillingSnapshotFromExtra(account.Extra)
+	billing := xai.MergeBillingProbeResult(previous, weekly.summary, monthly.summary, weeklyOK, monthlyOK)
+	billing = xai.StampBillingSummary(billing, statusCode, "billing_probe")
+	persistErr := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+		grokBillingExtraKey: billing,
+	})
+	if persistErr != nil {
+		slog.Warn("grok_billing_persist_failed", "account_id", account.ID, "error", persistErr)
+	}
+	now := time.Now().UTC()
+	localUsage24h, localUsage7d, localUsageMonthly := grokLocalUsageForQuota(ctx, s.usageLogRepo, account.ID, billing, now)
+	return &GrokQuotaProbeResult{
+		Source:            "billing_probe",
+		Billing:           billing,
+		LocalUsage24h:     localUsage24h,
+		LocalUsage7d:      localUsage7d,
+		LocalUsageMonthly: localUsageMonthly,
+		StatusCode:        statusCode,
+		FetchedAt:         now.Unix(),
+		Persisted:         persistErr == nil,
+	}, nil
+}
+
+func (s *GrokQuotaService) runProbeFlight(
+	ctx context.Context,
+	key string,
+	probe func(context.Context) (*GrokQuotaProbeResult, error),
+) (*GrokQuotaProbeResult, error) {
+	if s == nil {
+		return nil, infraerrors.New(http.StatusInternalServerError, "GROK_QUOTA_NOT_CONFIGURED", "grok quota service is not configured")
+	}
+	resultCh := s.probeFlight.DoChan(key, func() (any, error) {
+		sharedCtx, cancel := context.WithTimeout(context.Background(), grokQuotaUpstreamTimeout+5*time.Second)
+		defer cancel()
+		return probe(sharedCtx)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case flightResult := <-resultCh:
+		if flightResult.Err != nil {
+			return nil, flightResult.Err
+		}
+		result, ok := flightResult.Val.(*GrokQuotaProbeResult)
+		if !ok || result == nil {
+			return nil, infraerrors.New(http.StatusInternalServerError, "GROK_QUOTA_PROBE_RESULT_INVALID", "invalid Grok quota probe result")
+		}
+		cloned := *result
+		return &cloned, nil
+	}
+}
+
+func (s *GrokQuotaService) fetchBilling(
+	ctx context.Context,
+	account *Account,
+	token string,
+	proxyURL string,
+	weekly bool,
+) (*xai.BillingSummary, int, error) {
+	billingURL, err := buildGrokBillingURL(account, s.cfg, weekly)
+	if err != nil {
+		return nil, 0, infraerrors.Newf(http.StatusBadRequest, "GROK_QUOTA_BASE_URL_INVALID", "invalid Grok base_url: %v", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, billingURL, nil)
+	if err != nil {
+		return nil, 0, infraerrors.Newf(http.StatusInternalServerError, "GROK_QUOTA_PROBE_REQUEST_BUILD_FAILED", "failed to build billing request: %v", err)
+	}
+	xai.ApplyCLIBillingHeaders(req, token)
+	// billing 探测与真实转发保持同一套账号级请求头覆写。
+	account.ApplyHeaderOverrides(req.Header)
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 2))
+	if err != nil {
+		return nil, 0, infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_PROBE_REQUEST_FAILED", "billing request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, resp.StatusCode, nil
+	}
+	if resp.StatusCode >= 400 {
+		bodyText := truncate(strings.TrimSpace(string(bodyBytes)), 240)
+		slog.Warn("grok_quota_billing_failed", "account_id", account.ID, "weekly", weekly, "status", resp.StatusCode, "body", bodyText)
+		return nil, resp.StatusCode, infraerrors.Newf(mapUpstreamStatus(resp.StatusCode), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "billing returned %d: %s", resp.StatusCode, bodyText)
+	}
+	payload, err := xai.ParseBillingPayload(bodyBytes)
+	if err != nil {
+		return nil, resp.StatusCode, infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_BILLING_PARSE_ERROR", "failed to parse billing body: %v", err)
+	}
+	return xai.BuildBillingSummary(payload.Config), resp.StatusCode, nil
+}
+
+func mergeGrokBillingProbeErrors(weeklyStatus, monthlyStatus int, weeklyErr, monthlyErr error) error {
+	weeklyKey := grokBillingProbeErrorKey(weeklyStatus, weeklyErr)
+	monthlyKey := grokBillingProbeErrorKey(monthlyStatus, monthlyErr)
+	if weeklyKey == monthlyKey {
+		switch {
+		case weeklyErr != nil:
+			return weeklyErr
+		case monthlyErr != nil:
+			return monthlyErr
+		case weeklyStatus == http.StatusTooManyRequests:
+			return infraerrors.New(http.StatusTooManyRequests, "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "billing rate limited")
+		case weeklyStatus != 0 && weeklyStatus != http.StatusOK:
+			return infraerrors.New(mapUpstreamStatus(weeklyStatus), "GROK_QUOTA_PROBE_UPSTREAM_ERROR", "xAI billing endpoints returned the same upstream error")
+		default:
+			return infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_BILLING_EMPTY", "xAI billing endpoints returned no quota data")
+		}
+	}
+	slog.Warn("grok_quota_probe_parts_failed", "weekly_status", weeklyStatus, "weekly_error", weeklyErr, "monthly_status", monthlyStatus, "monthly_error", monthlyErr)
+	return infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_PROBE_PARTS_FAILED", "weekly and monthly billing probes failed differently").WithMetadata(map[string]string{
+		"weekly_status": strconv.Itoa(weeklyStatus), "monthly_status": strconv.Itoa(monthlyStatus),
+	})
+}
+
+func grokBillingProbeErrorKey(status int, err error) string {
+	if err != nil {
+		return strconv.Itoa(status) + ":" + strconv.Itoa(infraerrors.Code(err)) + ":" + infraerrors.Reason(err)
+	}
+	return strconv.Itoa(status) + ":empty"
+}
+
+func preferSuccessfulBillingStatus(weeklyStatus, monthlyStatus int, weeklyOK, monthlyOK bool) int {
+	if weeklyOK && weeklyStatus >= 200 && weeklyStatus < 300 {
+		return weeklyStatus
+	}
+	if monthlyOK && monthlyStatus >= 200 && monthlyStatus < 300 {
+		return monthlyStatus
+	}
+	if weeklyStatus != 0 {
+		return weeklyStatus
+	}
+	return monthlyStatus
 }
 
 func (s *GrokQuotaService) ResetQuota(ctx context.Context, accountID int64) (*GrokQuotaResetResult, error) {
@@ -143,6 +403,7 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	if err != nil {
 		return nil, "", "", err
 	}
+	proxyURL := s.resolveProxyURL(ctx, account)
 
 	token, err := s.tokenProvider.GetAccessToken(ctx, account)
 	if err != nil {
@@ -152,7 +413,7 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 		return nil, "", "", infraerrors.New(http.StatusBadGateway, "GROK_QUOTA_TOKEN_UNAVAILABLE", "access token is empty")
 	}
 
-	return account, token, s.resolveProxyURL(ctx, account), nil
+	return account, token, proxyURL, nil
 }
 
 func (s *GrokQuotaService) resolveProxyURL(ctx context.Context, account *Account) string {
@@ -164,6 +425,7 @@ func (s *GrokQuotaService) resolveProxyURL(ctx context.Context, account *Account
 		return account.Proxy.URL()
 	case s != nil && s.proxyRepo != nil:
 		if proxy, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && proxy != nil {
+			account.Proxy = proxy
 			return proxy.URL()
 		}
 	}
@@ -205,220 +467,6 @@ func buildGrokQuotaProbeBody(model string) ([]byte, error) {
 		"max_output_tokens": 1,
 		"store":             false,
 	})
-}
-
-func (s *GrokQuotaService) fetchManagementCredits(ctx context.Context, account *Account, proxyURL string) []xai.CreditBalance {
-	if s == nil || s.httpUpstream == nil || account == nil {
-		return nil
-	}
-	managementKey := strings.TrimSpace(firstNonEmpty(
-		account.GetCredential("management_key"),
-		account.GetCredential("management_api_key"),
-		account.GetCredential("xai_management_key"),
-	))
-	teamID := strings.TrimSpace(firstNonEmpty(
-		account.GetCredential("team_id"),
-		account.GetCredential("xai_team_id"),
-	))
-	if managementKey == "" || teamID == "" {
-		return nil
-	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(account.GetCredential("management_base_url")), "/")
-	if baseURL == "" {
-		baseURL = grokQuotaManagementDefaultBase
-	}
-	credits := make([]xai.CreditBalance, 0, 3)
-	for _, endpoint := range []struct {
-		path   string
-		parser func([]byte) []xai.CreditBalance
-	}{
-		{path: "/billing/teams/" + url.PathEscape(teamID) + "/postpaid/invoice/preview", parser: parseGrokPostpaidInvoicePreviewCredits},
-		{path: "/billing/teams/" + url.PathEscape(teamID) + "/postpaid/spending-limits", parser: parseGrokPostpaidSpendingLimitCredits},
-		{path: "/billing/teams/" + url.PathEscape(teamID) + "/prepaid/balance", parser: parseGrokPrepaidBalanceCredits},
-	} {
-		body, statusCode, err := s.fetchManagementBillingEndpoint(ctx, account, proxyURL, baseURL+endpoint.path, managementKey)
-		if err != nil {
-			slog.Debug("grok_management_billing_probe_failed", "account_id", account.ID, "path", endpoint.path, "error", err)
-			continue
-		}
-		if statusCode >= 400 {
-			slog.Debug("grok_management_billing_probe_non_success", "account_id", account.ID, "path", endpoint.path, "status", statusCode)
-			continue
-		}
-		credits = append(credits, endpoint.parser(body)...)
-	}
-	return credits
-}
-
-func (s *GrokQuotaService) fetchManagementBillingEndpoint(ctx context.Context, account *Account, proxyURL, targetURL, managementKey string) ([]byte, int, error) {
-	callCtx, cancel := context.WithTimeout(ctx, grokQuotaManagementTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+managementKey)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "sub2api-grok-management-quota/1.0")
-	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
-	if err != nil {
-		return nil, 0, err
-	}
-	if resp == nil {
-		return nil, 0, nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return body, resp.StatusCode, nil
-}
-
-func parseGrokPostpaidInvoicePreviewCredits(body []byte) []xai.CreditBalance {
-	credits := make([]xai.CreditBalance, 0, 3)
-	if value := centsResultToDollars(gjson.GetBytes(body, "defaultCredits")); value != nil {
-		credits = append(credits, xai.CreditBalance{
-			CreditType: "monthly_credits",
-			Label:      "Monthly credits",
-			Amount:     value,
-			Currency:   "USD",
-			Source:     "management_postpaid_invoice_preview",
-		})
-	}
-	if value := centsResultToDollars(firstGJSON(body, "effectiveSpendingLimit", "spendingLimit", "softSpendingLimit")); value != nil {
-		credits = append(credits, xai.CreditBalance{
-			CreditType: "pay_as_you_go",
-			Label:      "Pay-as-you-go",
-			Limit:      value,
-			Currency:   "USD",
-			Source:     "management_postpaid_invoice_preview",
-		})
-	}
-	if prepaid := centsResultToDollars(gjson.GetBytes(body, "coreInvoice.prepaidCredits")); prepaid != nil {
-		credit := xai.CreditBalance{
-			CreditType: "prepaid_credits",
-			Label:      "Prepaid credits",
-			Amount:     prepaid,
-			Currency:   "USD",
-			Source:     "management_postpaid_invoice_preview",
-		}
-		if used := centsResultToDollars(gjson.GetBytes(body, "coreInvoice.prepaidCreditsUsed")); used != nil {
-			credit.Used = used
-			remaining := *prepaid - *used
-			if remaining < 0 {
-				remaining = 0
-			}
-			credit.Remaining = &remaining
-		}
-		credits = append(credits, credit)
-	}
-	return credits
-}
-
-func parseGrokPostpaidSpendingLimitCredits(body []byte) []xai.CreditBalance {
-	if value := centsResultToDollars(firstGJSON(body, "effectiveSpendingLimit", "effectiveSl", "softSpendingLimit", "softSl")); value != nil {
-		return []xai.CreditBalance{{
-			CreditType: "pay_as_you_go",
-			Label:      "Pay-as-you-go",
-			Limit:      value,
-			Currency:   "USD",
-			Source:     "management_postpaid_spending_limits",
-		}}
-	}
-	return nil
-}
-
-func parseGrokPrepaidBalanceCredits(body []byte) []xai.CreditBalance {
-	if value := centsResultToDollars(firstGJSON(body, "total", "balance", "remaining", "prepaidCredits")); value != nil {
-		return []xai.CreditBalance{{
-			CreditType: "prepaid_credits",
-			Label:      "Prepaid credits",
-			Remaining:  value,
-			Currency:   "USD",
-			Source:     "management_prepaid_balance",
-		}}
-	}
-	return nil
-}
-
-func mergeGrokCreditBalances(existing, incoming []xai.CreditBalance) []xai.CreditBalance {
-	if len(existing) == 0 {
-		return incoming
-	}
-	out := append([]xai.CreditBalance(nil), existing...)
-	for _, next := range incoming {
-		merged := false
-		for i := range out {
-			if out[i].CreditType != "" && out[i].CreditType == next.CreditType {
-				if next.Label != "" {
-					out[i].Label = next.Label
-				}
-				if next.Amount != nil {
-					out[i].Amount = next.Amount
-				}
-				if next.Limit != nil {
-					out[i].Limit = next.Limit
-				}
-				if next.Used != nil {
-					out[i].Used = next.Used
-				}
-				if next.Remaining != nil {
-					out[i].Remaining = next.Remaining
-				}
-				if next.Currency != "" {
-					out[i].Currency = next.Currency
-				}
-				if next.ResetAt != "" {
-					out[i].ResetAt = next.ResetAt
-				}
-				if next.Source != "" {
-					out[i].Source = next.Source
-				}
-				merged = true
-				break
-			}
-		}
-		if !merged {
-			out = append(out, next)
-		}
-	}
-	return out
-}
-
-func firstGJSON(body []byte, paths ...string) gjson.Result {
-	for _, path := range paths {
-		if result := gjson.GetBytes(body, path); result.Exists() {
-			return result
-		}
-	}
-	return gjson.Result{}
-}
-
-func centsResultToDollars(result gjson.Result) *float64 {
-	if !result.Exists() {
-		return nil
-	}
-	var cents float64
-	switch result.Type {
-	case gjson.Number:
-		cents = result.Float()
-	case gjson.String:
-		raw := strings.TrimSpace(result.String())
-		if raw == "" {
-			return nil
-		}
-		value, err := strconv.ParseFloat(strings.ReplaceAll(strings.TrimPrefix(raw, "$"), ",", ""), 64)
-		if err != nil {
-			return nil
-		}
-		cents = value
-	default:
-		return nil
-	}
-	dollars := cents / 100
-	return &dollars
 }
 
 func maxInt(a, b int) int {
